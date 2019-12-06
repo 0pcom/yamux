@@ -162,6 +162,18 @@ func (s *Stream) write(b []byte) (n int, err error) {
 	var flags uint16
 	var max uint32
 	var body io.Reader
+
+	var timeout <-chan time.Time
+	writeDeadline := s.writeDeadline.Load().(time.Time)
+	if !writeDeadline.IsZero() {
+		delay := writeDeadline.Sub(time.Now())
+		if delay < 0 {
+			return 0, ErrTimeout
+		}
+
+		timeout = time.After(delay)
+	}
+
 START:
 	s.stateLock.Lock()
 	switch s.state {
@@ -202,19 +214,12 @@ START:
 	return int(max), err
 
 WAIT:
-	var timeout <-chan time.Time
-	writeDeadline := s.writeDeadline.Load().(time.Time)
-	if !writeDeadline.IsZero() {
-		delay := writeDeadline.Sub(time.Now())
-		timeout = time.After(delay)
-	}
 	select {
 	case <-s.sendNotifyCh:
 		goto START
 	case <-timeout:
 		return 0, ErrTimeout
 	}
-	return 0, nil
 }
 
 // sendFlags determines any flags that are appropriate
