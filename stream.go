@@ -2,7 +2,6 @@ package yamux
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -48,30 +47,27 @@ type Stream struct {
 	recvNotifyCh chan struct{}
 	sendNotifyCh chan struct{}
 
-	readDeadlineLock sync.Mutex
-	readTimer        *time.Timer
-	readTimedOut     uint32
-
-	writeDeadlineLock sync.Mutex
-	writeTimer        *time.Timer
-	writeTimedOut     uint32
+	readDeadline  pipeDeadline
+	writeDeadline pipeDeadline
 }
 
 // newStream is used to construct a new stream within
 // a given session for an ID
 func newStream(session *Session, id uint32, state streamState) *Stream {
 	s := &Stream{
-		id:           id,
-		session:      session,
-		state:        state,
-		controlHdr:   header(make([]byte, headerSize)),
-		controlErr:   make(chan error, 1),
-		sendHdr:      header(make([]byte, headerSize)),
-		sendErr:      make(chan error, 1),
-		recvWindow:   initialStreamWindow,
-		sendWindow:   initialStreamWindow,
-		recvNotifyCh: make(chan struct{}, 1),
-		sendNotifyCh: make(chan struct{}, 1),
+		id:            id,
+		session:       session,
+		state:         state,
+		controlHdr:    header(make([]byte, headerSize)),
+		controlErr:    make(chan error, 1),
+		sendHdr:       header(make([]byte, headerSize)),
+		sendErr:       make(chan error, 1),
+		recvWindow:    initialStreamWindow,
+		sendWindow:    initialStreamWindow,
+		recvNotifyCh:  make(chan struct{}, 1),
+		sendNotifyCh:  make(chan struct{}, 1),
+		readDeadline:  makePipeDeadline(),
+		writeDeadline: makePipeDeadline(),
 	}
 	return s
 }
@@ -90,14 +86,9 @@ func (s *Stream) StreamID() uint32 {
 func (s *Stream) Read(b []byte) (n int, err error) {
 	defer asyncNotify(s.recvNotifyCh)
 
-	if s.isReadTimedOut() {
-		return 0, timeoutError{}
+	if isClosedChan(s.readDeadline.wait()) {
+		return 0, ErrTimeout
 	}
-
-	timeout := make(chan struct{})
-
-	cancel := s.timeoutObserver(timeout, s.isReadTimedOut)
-	defer cancel()
 
 	for {
 		s.stateLock.Lock()
@@ -137,7 +128,7 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 		select {
 		case <-s.recvNotifyCh:
 			continue
-		case <-timeout:
+		case <-s.readDeadline.wait():
 			return 0, ErrTimeout
 		}
 	}
@@ -165,14 +156,9 @@ func (s *Stream) write(b []byte) (n int, err error) {
 	var max uint32
 	var body io.Reader
 
-	if s.isWriteTimedOut() {
-		return 0, timeoutError{}
+	if isClosedChan(s.writeDeadline.wait()) {
+		return 0, ErrTimeout
 	}
-
-	timeout := make(chan struct{})
-
-	cancel := s.timeoutObserver(timeout, s.isWriteTimedOut)
-	defer cancel()
 
 	for {
 		s.stateLock.Lock()
@@ -214,7 +200,7 @@ func (s *Stream) write(b []byte) (n int, err error) {
 		select {
 		case <-s.sendNotifyCh:
 			continue
-		case <-timeout:
+		case <-s.writeDeadline.wait():
 			return 0, ErrTimeout
 		}
 	}
@@ -451,59 +437,13 @@ func (s *Stream) SetDeadline(t time.Time) error {
 
 // SetReadDeadline sets the deadline for future Read calls.
 func (s *Stream) SetReadDeadline(t time.Time) error {
-	s.readDeadlineLock.Lock()
-	defer s.readDeadlineLock.Unlock()
-
-	s.setReadTimedOut(false)
-
-	d := time.Until(t)
-	if t.IsZero() || d < 0 {
-		if s.readTimer != nil {
-			s.readTimer.Stop()
-		}
-
-		s.readTimer = nil
-	} else {
-		// Interrupt I/O operation once timer has expired
-		s.readTimer = time.AfterFunc(d, func() {
-			s.setReadTimedOut(true)
-		})
-	}
-
-	if !t.IsZero() && d < 0 {
-		// Interrupt current I/O operation
-		s.setReadTimedOut(true)
-	}
-
+	s.readDeadline.set(t)
 	return nil
 }
 
 // SetWriteDeadline sets the deadline for future Write calls
 func (s *Stream) SetWriteDeadline(t time.Time) error {
-	s.writeDeadlineLock.Lock()
-	defer s.writeDeadlineLock.Unlock()
-
-	s.setWriteTimedOut(false)
-
-	d := time.Until(t)
-	if t.IsZero() || d < 0 {
-		if s.writeTimer != nil {
-			s.writeTimer.Stop()
-		}
-
-		s.writeTimer = nil
-	} else {
-		// Interrupt I/O operation once timer has expired
-		s.writeTimer = time.AfterFunc(d, func() {
-			s.setWriteTimedOut(true)
-		})
-	}
-
-	if !t.IsZero() && d < 0 {
-		// Interrupt current I/O operation
-		s.setWriteTimedOut(true)
-	}
-
+	s.writeDeadline.set(t)
 	return nil
 }
 
@@ -516,53 +456,4 @@ func (s *Stream) Shrink() {
 		s.recvBuf = nil
 	}
 	s.recvLock.Unlock()
-}
-
-func (s *Stream) isReadTimedOut() bool {
-	return atomic.LoadUint32(&s.readTimedOut) != 0
-}
-
-func (s *Stream) setReadTimedOut(timedOut bool) {
-	if timedOut {
-		atomic.StoreUint32(&s.readTimedOut, 1)
-		return
-	}
-
-	atomic.StoreUint32(&s.readTimedOut, 0)
-}
-
-func (s *Stream) isWriteTimedOut() bool {
-	return atomic.LoadUint32(&s.writeTimedOut) != 0
-}
-
-func (s *Stream) setWriteTimedOut(timedOut bool) {
-	if timedOut {
-		atomic.StoreUint32(&s.writeTimedOut, 1)
-		return
-	}
-
-	atomic.StoreUint32(&s.writeTimedOut, 0)
-}
-
-func (s *Stream) timeoutObserver(ch chan struct{}, timedOut func() bool) func() {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
-	loop:
-		for {
-			select {
-			case <-ticker.C:
-				if timedOut() {
-					close(ch)
-					break loop
-				}
-			case <-ctx.Done():
-				break loop
-			}
-		}
-		ticker.Stop()
-	}()
-
-	return cancel
 }
