@@ -99,48 +99,47 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 	cancel := s.timeoutObserver(timeout, s.isReadTimedOut)
 	defer cancel()
 
-START:
-	s.stateLock.Lock()
-	switch s.state {
-	case streamLocalClose:
-		fallthrough
-	case streamRemoteClose:
-		fallthrough
-	case streamClosed:
+	for {
+		s.stateLock.Lock()
+		switch s.state {
+		case streamLocalClose:
+			fallthrough
+		case streamRemoteClose:
+			fallthrough
+		case streamClosed:
+			s.recvLock.Lock()
+			if s.recvBuf == nil || s.recvBuf.Len() == 0 {
+				s.recvLock.Unlock()
+				s.stateLock.Unlock()
+				return 0, io.EOF
+			}
+			s.recvLock.Unlock()
+		case streamReset:
+			s.stateLock.Unlock()
+			return 0, ErrConnectionReset
+		}
+		s.stateLock.Unlock()
+
+		// If there is no data available, block
 		s.recvLock.Lock()
 		if s.recvBuf == nil || s.recvBuf.Len() == 0 {
 			s.recvLock.Unlock()
-			s.stateLock.Unlock()
-			return 0, io.EOF
+		} else {
+			// Read any bytes
+			n, _ = s.recvBuf.Read(b)
+			s.recvLock.Unlock()
+
+			// Send a window update potentially
+			err = s.sendWindowUpdate()
+			return n, err
 		}
-		s.recvLock.Unlock()
-	case streamReset:
-		s.stateLock.Unlock()
-		return 0, ErrConnectionReset
-	}
-	s.stateLock.Unlock()
 
-	// If there is no data available, block
-	s.recvLock.Lock()
-	if s.recvBuf == nil || s.recvBuf.Len() == 0 {
-		s.recvLock.Unlock()
-		goto WAIT
-	}
-
-	// Read any bytes
-	n, _ = s.recvBuf.Read(b)
-	s.recvLock.Unlock()
-
-	// Send a window update potentially
-	err = s.sendWindowUpdate()
-	return n, err
-
-WAIT:
-	select {
-	case <-s.recvNotifyCh:
-		goto START
-	case <-timeout:
-		return 0, ErrTimeout
+		select {
+		case <-s.recvNotifyCh:
+			continue
+		case <-timeout:
+			return 0, ErrTimeout
+		}
 	}
 }
 
@@ -175,51 +174,49 @@ func (s *Stream) write(b []byte) (n int, err error) {
 	cancel := s.timeoutObserver(timeout, s.isWriteTimedOut)
 	defer cancel()
 
-START:
-	s.stateLock.Lock()
-	switch s.state {
-	case streamLocalClose:
-		fallthrough
-	case streamClosed:
+	for {
+		s.stateLock.Lock()
+		switch s.state {
+		case streamLocalClose:
+			fallthrough
+		case streamClosed:
+			s.stateLock.Unlock()
+			return 0, ErrStreamClosed
+		case streamReset:
+			s.stateLock.Unlock()
+			return 0, ErrConnectionReset
+		}
 		s.stateLock.Unlock()
-		return 0, ErrStreamClosed
-	case streamReset:
-		s.stateLock.Unlock()
-		return 0, ErrConnectionReset
-	}
-	s.stateLock.Unlock()
 
-	// If there is no data available, block
-	window := atomic.LoadUint32(&s.sendWindow)
-	if window == 0 {
-		goto WAIT
-	}
+		// If there is no data available, block
+		window := atomic.LoadUint32(&s.sendWindow)
+		if window != 0 {
+			// Determine the flags if any
+			flags = s.sendFlags()
 
-	// Determine the flags if any
-	flags = s.sendFlags()
+			// Send up to our send window
+			max = min(window, uint32(len(b)))
+			body = bytes.NewReader(b[:max])
 
-	// Send up to our send window
-	max = min(window, uint32(len(b)))
-	body = bytes.NewReader(b[:max])
+			// Send the header
+			s.sendHdr.encode(typeData, flags, s.id, max)
+			if err = s.session.waitForSendErr(s.sendHdr, body, s.sendErr); err != nil {
+				return 0, err
+			}
 
-	// Send the header
-	s.sendHdr.encode(typeData, flags, s.id, max)
-	if err = s.session.waitForSendErr(s.sendHdr, body, s.sendErr); err != nil {
-		return 0, err
-	}
+			// Reduce our send window
+			atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
 
-	// Reduce our send window
-	atomic.AddUint32(&s.sendWindow, ^uint32(max-1))
+			// Unlock
+			return int(max), err
+		}
 
-	// Unlock
-	return int(max), err
-
-WAIT:
-	select {
-	case <-s.sendNotifyCh:
-		goto START
-	case <-timeout:
-		return 0, ErrTimeout
+		select {
+		case <-s.sendNotifyCh:
+			continue
+		case <-timeout:
+			return 0, ErrTimeout
+		}
 	}
 }
 
