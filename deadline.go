@@ -1,3 +1,4 @@
+// Copied from https://golang.org/src/net/pipe.go
 package yamux
 
 import (
