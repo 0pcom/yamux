@@ -85,6 +85,20 @@ func (s *Stream) StreamID() uint32 {
 // Read is used to read from the stream
 func (s *Stream) Read(b []byte) (n int, err error) {
 	defer asyncNotify(s.recvNotifyCh)
+
+	var timeout <-chan time.Time
+	var timer *time.Timer
+	readDeadline := s.readDeadline.Load().(time.Time)
+	if !readDeadline.IsZero() {
+		delay := readDeadline.Sub(time.Now())
+		if delay < 0 {
+			return 0, ErrTimeout
+		}
+
+		timer = time.NewTimer(delay)
+		timeout = timer.C
+	}
+
 START:
 	s.stateLock.Lock()
 	switch s.state {
@@ -122,14 +136,6 @@ START:
 	return n, err
 
 WAIT:
-	var timeout <-chan time.Time
-	var timer *time.Timer
-	readDeadline := s.readDeadline.Load().(time.Time)
-	if !readDeadline.IsZero() {
-		delay := readDeadline.Sub(time.Now())
-		timer = time.NewTimer(delay)
-		timeout = timer.C
-	}
 	select {
 	case <-s.recvNotifyCh:
 		if timer != nil {
