@@ -288,6 +288,40 @@ func TestNonNilInterface(t *testing.T) {
 	}
 }
 
+func TestSendData_EmptyTimeout(t *testing.T) {
+	client, server := testClientServer()
+	defer client.Close()
+	defer server.Close()
+
+	stream, err := client.Open()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if client.NumStreams() != 1 {
+		t.Fatalf("bad")
+	}
+
+	timeInThePast := time.Now().Add(-1 * time.Second)
+	err = stream.SetWriteDeadline(timeInThePast)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	emptyBuffer := make([]byte, 0)
+	n, err := stream.Write(emptyBuffer)
+	if err != ErrTimeout {
+		t.Fatalf("err: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("short write %d", n)
+	}
+
+	if err := stream.Close(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+}
+
 func TestSendData_Small(t *testing.T) {
 	client, server := testClientServer()
 	defer client.Close()
