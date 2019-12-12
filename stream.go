@@ -136,6 +136,10 @@ func (s *Stream) Read(b []byte) (n int, err error) {
 
 // Write is used to write to the stream
 func (s *Stream) Write(b []byte) (n int, err error) {
+	if isClosedChan(s.writeDeadline.wait()) {
+		return 0, ErrTimeout
+	}
+
 	s.sendLock.Lock()
 	defer s.sendLock.Unlock()
 	total := 0
