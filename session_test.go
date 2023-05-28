@@ -2,10 +2,12 @@ package yamux
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"reflect"
 	"runtime"
 	"strings"
@@ -273,6 +275,109 @@ func TestAccept(t *testing.T) {
 	}
 }
 
+func TestOpenStreamTimeout(t *testing.T) {
+	const timeout = 25 * time.Millisecond
+
+	cfg := testConf()
+	cfg.StreamOpenTimeout = timeout
+
+	client, server := testClientServerConfig(cfg)
+	defer client.Close()
+	defer server.Close()
+
+	clientLogs := captureLogs(client)
+
+	// Open a single stream without a server to acknowledge it.
+	s, err := client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sleep for longer than the stream open timeout.
+	// Since no ACKs are received, the stream and session should be closed.
+	time.Sleep(timeout * 5)
+
+	if !clientLogs.match([]string{"[ERR] yamux: aborted stream open (destination=yamux:remote): i/o deadline reached"}) {
+		t.Fatalf("server log incorect: %v", clientLogs.logs())
+	}
+	if s.state != streamClosed {
+		t.Fatalf("stream should have been closed")
+	}
+	if !client.IsClosed() {
+		t.Fatalf("session should have been closed")
+	}
+}
+
+func TestClose_closeTimeout(t *testing.T) {
+	conf := testConf()
+	conf.StreamCloseTimeout = 10 * time.Millisecond
+	client, server := testClientServerConfig(conf)
+	defer client.Close()
+	defer server.Close()
+
+	if client.NumStreams() != 0 {
+		t.Fatalf("bad")
+	}
+	if server.NumStreams() != 0 {
+		t.Fatalf("bad")
+	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(2)
+
+	// Open a stream on the client but only close it on the server.
+	// We want to see if the stream ever gets cleaned up on the client.
+
+	var clientStream *Stream
+	go func() {
+		defer wg.Done()
+		var err error
+		clientStream, err = client.OpenStream()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		stream, err := server.AcceptStream()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	}()
+
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+
+	select {
+	case <-doneCh:
+	case <-time.After(time.Second):
+		panic("timeout")
+	}
+
+	// We should have zero streams after our timeout period
+	time.Sleep(100 * time.Millisecond)
+
+	if v := server.NumStreams(); v > 0 {
+		t.Fatalf("should have zero streams: %d", v)
+	}
+	if v := client.NumStreams(); v > 0 {
+		t.Fatalf("should have zero streams: %d", v)
+	}
+
+	if _, err := clientStream.Write([]byte("hello")); err == nil {
+		t.Fatal("should error on write")
+	} else if err.Error() != "connection reset" {
+		t.Fatalf("expected connection reset, got %q", err)
+	}
+}
+
 func TestNonNilInterface(t *testing.T) {
 	_, server := testClientServer()
 	server.Close()
@@ -393,15 +498,15 @@ func TestSendData_Small(t *testing.T) {
 	}()
 	select {
 	case <-doneCh:
+		if client.NumStreams() != 0 {
+			t.Fatalf("bad")
+		}
+		if server.NumStreams() != 0 {
+			t.Fatalf("bad")
+		}
+		return
 	case <-time.After(time.Second):
 		panic("timeout")
-	}
-
-	if client.NumStreams() != 0 {
-		t.Fatalf("bad")
-	}
-	if server.NumStreams() != 0 {
-		t.Fatalf("bad")
 	}
 }
 
@@ -473,7 +578,6 @@ func TestSendData_Large(t *testing.T) {
 			t.Fatalf("err: %v", err)
 		}
 	}()
-
 	doneCh := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -481,6 +585,7 @@ func TestSendData_Large(t *testing.T) {
 	}()
 	select {
 	case <-doneCh:
+		return
 	case <-time.After(5 * time.Second):
 		panic("timeout")
 	}
@@ -705,6 +810,62 @@ func TestHalfClose(t *testing.T) {
 	}
 }
 
+func TestHalfCloseSessionShutdown(t *testing.T) {
+	client, server := testClientServer()
+	defer client.Close()
+	defer server.Close()
+
+	// dataSize must be large enough to ensure the server will send a window
+	// update
+	dataSize := int64(server.config.MaxStreamWindowSize)
+
+	data := make([]byte, dataSize)
+	for idx := range data {
+		data[idx] = byte(idx % 256)
+	}
+
+	stream, err := client.Open()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if _, err = stream.Write(data); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	stream2, err := server.Accept()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if err := stream.Close(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Shut down the session of the sending side. This should not cause reads
+	// to fail on the receiving side.
+	if err := client.Close(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	buf := make([]byte, dataSize)
+	n, err := stream2.Read(buf)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if int64(n) != dataSize {
+		t.Fatalf("bad: %v", n)
+	}
+
+	// EOF after close
+	n, err = stream2.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("err: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("bad: %v", n)
+	}
+}
+
 func TestReadDeadline(t *testing.T) {
 	client, server := testClientServer()
 	defer client.Close()
@@ -727,8 +888,70 @@ func TestReadDeadline(t *testing.T) {
 	}
 
 	buf := make([]byte, 4)
-	if _, err := stream.Read(buf); err != ErrTimeout {
+	_, err = stream.Read(buf)
+	if err != ErrTimeout {
 		t.Fatalf("err: %v", err)
+	}
+
+	// See https://github.com/hashicorp/yamux/issues/90
+	// The standard library's http server package will read from connections in
+	// the background to detect if they are alive.
+	//
+	// It sets a read deadline on connections and detect if the returned error
+	// is a network timeout error which implements net.Error.
+	//
+	// The HTTP server will cancel all server requests if it isn't timeout error
+	// from the connection.
+	//
+	// We assert that we return an error meeting the interface to avoid
+	// accidently breaking yamux session compatability with the standard
+	// library's http server implementation.
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("reading timeout error is expected to implement net.Error and return true when calling Timeout()")
+	}
+}
+
+func TestReadDeadline_BlockedRead(t *testing.T) {
+	client, server := testClientServer()
+	defer client.Close()
+	defer server.Close()
+
+	stream, err := client.Open()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer stream.Close()
+
+	stream2, err := server.Accept()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer stream2.Close()
+
+	// Start a read that will block
+	errCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4)
+		_, err := stream.Read(buf)
+		errCh <- err
+		close(errCh)
+	}()
+
+	// Wait to ensure the read has started.
+	time.Sleep(5 * time.Millisecond)
+
+	// Update the read deadline
+	if err := stream.SetReadDeadline(time.Now().Add(5 * time.Millisecond)); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	select {
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected read timeout")
+	case err := <-errCh:
+		if err != ErrTimeout {
+			t.Fatalf("expected ErrTimeout; got %v", err)
+		}
 	}
 }
 
@@ -763,6 +986,59 @@ func TestWriteDeadline(t *testing.T) {
 		}
 	}
 	t.Fatalf("Expected timeout")
+}
+
+func TestWriteDeadline_BlockedWrite(t *testing.T) {
+	client, server := testClientServer()
+	defer client.Close()
+	defer server.Close()
+
+	stream, err := client.Open()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer stream.Close()
+
+	stream2, err := server.Accept()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer stream2.Close()
+
+	// Start a goroutine making writes that will block
+	errCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 512)
+		for i := 0; i < int(initialStreamWindow); i++ {
+			_, err := stream.Write(buf)
+			if err == nil {
+				continue
+			}
+
+			errCh <- err
+			close(errCh)
+			return
+		}
+
+		close(errCh)
+	}()
+
+	// Wait to ensure the write has started.
+	time.Sleep(5 * time.Millisecond)
+
+	// Update the write deadline
+	if err := stream.SetWriteDeadline(time.Now().Add(5 * time.Millisecond)); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	select {
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected write timeout")
+	case err := <-errCh:
+		if err != ErrTimeout {
+			t.Fatalf("expected ErrTimeout; got %v", err)
+		}
+	}
 }
 
 func TestBacklogExceeded(t *testing.T) {
@@ -861,6 +1137,8 @@ func TestKeepAlive_Timeout(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatalf("timeout waiting for timeout")
 	}
+
+	clientConn.writeBlocker.Unlock()
 
 	if !server.IsClosed() {
 		t.Fatalf("server should have closed")
@@ -1058,6 +1336,7 @@ func TestSession_WindowUpdateWriteDuringRead(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		_, err = stream.Read(make([]byte, flood))
 		if err != ErrConnectionWriteTimeout {
@@ -1153,6 +1432,7 @@ func TestSession_sendNoWait_Timeout(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		hdr := header(make([]byte, headerSize))
 		hdr.encode(typePing, flagACK, 0, 0)
@@ -1273,6 +1553,7 @@ func TestSession_ConnectionWriteTimeout(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		// Since the write goroutine is blocked then this will return a
 		// timeout since it can't get feedback about whether the write
@@ -1285,6 +1566,33 @@ func TestSession_ConnectionWriteTimeout(t *testing.T) {
 			t.Fatalf("lied about writes: %d", n)
 		}
 	}()
+
+	wg.Wait()
+}
+
+func TestCancelAccept(t *testing.T) {
+	_, server := testClientServer()
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		stream, err := server.AcceptStreamWithContext(ctx)
+		if err != context.Canceled {
+			t.Fatalf("err: %v", err)
+		}
+
+		if stream != nil {
+			defer stream.Close()
+		}
+	}()
+
+	cancel()
 
 	wg.Wait()
 }
